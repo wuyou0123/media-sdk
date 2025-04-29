@@ -28,6 +28,12 @@ import (
 	"github.com/livekit/protocol/logger"
 )
 
+/*
+#cgo pkg-config: opus
+#include <opus.h>
+*/
+import "C"
+
 type Sample []byte
 
 func (s Sample) Size() int {
@@ -44,16 +50,16 @@ func (s Sample) CopyTo(dst []byte) (int, error) {
 
 type Writer = media.WriteCloser[Sample]
 
-func Decode(w media.PCM16Writer, channels int, logger logger.Logger) (Writer, error) {
-	dec, err := opus.NewDecoder(w.SampleRate(), channels)
-	if err != nil {
-		return nil, err
+func Decode(w media.PCM16Writer, targetChannels int, logger logger.Logger) (Writer, error) {
+	if targetChannels != 1 && targetChannels != 2 {
+		return nil, fmt.Errorf("opus decoder only supports mono or stereo output")
 	}
+
 	return &decoder{
-		w:      w,
-		dec:    dec,
-		buf:    make([]int16, w.SampleRate()/rtp.DefFramesPerSec*channels),
-		logger: logger,
+		w:              w,
+		targetChannels: targetChannels,
+		lastChannels:   targetChannels,
+		logger:         logger,
 	}, nil
 }
 
@@ -76,6 +82,9 @@ type decoder struct {
 	buf    media.PCM16Sample
 	logger logger.Logger
 
+	targetChannels int
+	lastChannels   int
+
 	successiveErrorCount int
 }
 
@@ -88,6 +97,11 @@ func (d *decoder) SampleRate() int {
 }
 
 func (d *decoder) WriteSample(in Sample) error {
+	channels, err := d.resetForSample(in)
+	if err != nil {
+		return err
+	}
+
 	n, err := d.dec.Decode(in, d.buf)
 	if err != nil {
 		// Some workflows (concatenating opus files) can cause a suprious decoding error, so ignore small amount of corruption errors
@@ -99,7 +113,33 @@ func (d *decoder) WriteSample(in Sample) error {
 		return nil
 	}
 	d.successiveErrorCount = 0
-	return d.w.WriteSample(d.buf[:n])
+
+	returnData := d.buf[:n]
+	if channels < d.targetChannels {
+		returnData = monoToStereo(returnData)
+	} else if channels > d.targetChannels {
+		returnData = stereoToMono(returnData)
+	}
+
+	return d.w.WriteSample(returnData)
+}
+
+func (d *decoder) resetForSample(in Sample) (int, error) {
+	channels := int(C.opus_packet_get_nb_channels((*C.uchar)(&in[0])))
+
+	if d.dec == nil || d.lastChannels != channels {
+		dec, err := opus.NewDecoder(d.w.SampleRate(), channels)
+		if err != nil {
+			d.logger.Errorw("opus decoder failed to reset", err)
+			return 0, err
+		}
+		d.dec = dec
+
+		d.buf = make([]int16, d.w.SampleRate()/rtp.DefFramesPerSec*channels)
+		d.lastChannels = channels
+	}
+
+	return channels, nil
 }
 
 func (d *decoder) Close() error {
@@ -135,4 +175,25 @@ func (e *encoder) Close() error {
 
 func NewWebmWriter(w io.WriteCloser, sampleRate int, sampleDur time.Duration) media.WriteCloser[Sample] {
 	return webm.NewWriter[Sample](w, "A_OPUS", 2, sampleRate, sampleDur)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+func monoToStereo(in media.PCM16Sample) media.PCM16Sample {
+	// duplicate mono samples to both channels
+	out := make(media.PCM16Sample, len(in)*2)
+	for i := range in {
+		out[i*2] = in[i]
+		out[i*2+1] = in[i]
+	}
+	return out
+}
+
+func stereoToMono(in media.PCM16Sample) media.PCM16Sample {
+	// average stereo samples to mono
+	out := make(media.PCM16Sample, len(in)/2)
+	for i := range out {
+		out[i] = (in[i*2] + in[i*2+1]) / 2
+	}
+	return out
 }
