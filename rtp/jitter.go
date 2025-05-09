@@ -1,4 +1,4 @@
-// Copyright 2024 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,34 +19,56 @@ import (
 
 	"github.com/pion/rtp"
 
-	"github.com/livekit/server-sdk-go/v2/pkg/jitter"
+	"github.com/livekit/media-sdk/jitter"
 )
 
 const (
 	jitterMaxLatency = 60 * time.Millisecond // should match mixer's target buffer size
 )
 
-func HandleJitter(clockRate int, h Handler) Handler {
-	return &jitterHandler{
+func HandleJitter(h Handler) Handler {
+	out := make(chan []*rtp.Packet, 10)
+	handler := &jitterHandler{
 		h:   h,
-		buf: jitter.NewBuffer(audioDepacketizer{}, uint32(clockRate), jitterMaxLatency),
+		buf: jitter.NewBuffer(audioDepacketizer{}, jitterMaxLatency, out, nil),
+		out: out,
+		err: make(chan error, 1),
 	}
+	go handler.run()
+	return handler
 }
 
 type jitterHandler struct {
 	h   Handler
 	buf *jitter.Buffer
+	out chan []*rtp.Packet
+	err chan error
 }
 
 func (r *jitterHandler) HandleRTP(h *rtp.Header, payload []byte) error {
 	r.buf.Push(&rtp.Packet{Header: *h, Payload: payload})
-	var last error
-	for _, p := range r.buf.Pop(false) {
-		if err := r.h.HandleRTP(&p.Header, p.Payload); err != nil {
-			last = err
+
+	select {
+	case err := <-r.err:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (r *jitterHandler) run() {
+	for sample := range r.out {
+		for _, pkt := range sample {
+			if err := r.h.HandleRTP(&pkt.Header, pkt.Payload); err != nil {
+				select {
+				case r.err <- err:
+					// error pushed
+				default:
+					// error channel is full, don't block
+				}
+			}
 		}
 	}
-	return last
 }
 
 type audioDepacketizer struct{}
