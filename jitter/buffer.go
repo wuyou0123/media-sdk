@@ -18,13 +18,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/pion/rtp"
+
+	"github.com/livekit/protocol/logger"
 )
 
 type Buffer struct {
 	depacketizer rtp.Depacketizer
 	latency      time.Duration
 	out          chan []*rtp.Packet
+	logger       logger.Logger
 	onPacketLoss func()
 
 	mu sync.Mutex
@@ -41,6 +45,8 @@ type Buffer struct {
 	size int
 }
 
+type Option func(*Buffer)
+
 type BufferStats struct {
 	PacketsPushed  uint64 // total packets pushed
 	PaddingPushed  uint64 // padding packets pushed
@@ -54,15 +60,18 @@ func NewBuffer(
 	depacketizer rtp.Depacketizer,
 	latency time.Duration,
 	out chan []*rtp.Packet,
-	onPacketLoss func(),
+	opts ...Option,
 ) *Buffer {
 	b := &Buffer{
 		depacketizer: depacketizer,
 		latency:      latency,
 		out:          out,
-		onPacketLoss: onPacketLoss,
+		logger:       logger.LogRLogger(logr.Discard()),
 		stats:        &BufferStats{},
 		timer:        time.NewTimer(latency),
+	}
+	for _, opt := range opts {
+		opt(b)
 	}
 
 	go func() {
@@ -73,6 +82,23 @@ func NewBuffer(
 		}
 	}()
 
+	return b
+}
+
+func WithLogger(logger logger.Logger) Option {
+	return func(b *Buffer) {
+		b.logger = logger
+	}
+}
+
+func WithPacketLossHandler(handler func()) Option {
+	return func(b *Buffer) {
+		b.onPacketLoss = handler
+	}
+}
+
+func (b *Buffer) WithLogger(logger logger.Logger) *Buffer {
+	b.logger = logger
 	return b
 }
 
@@ -231,17 +257,24 @@ func (b *Buffer) popReady() {
 		b.head.isComplete() {
 
 		if b.head.packet.SequenceNumber == b.prevSN+1 || b.head.discont || !b.initialized {
-			if sample := b.popSample(); len(sample) > 0 {
-				b.out <- sample
-			}
+			// normal
 		} else if b.head.received.Before(expiry) {
+			// max latency reached
 			loss = true
 			b.stats.PacketsLost += uint64(b.head.packet.SequenceNumber - b.prevSN - 1)
-			if sample := b.popSample(); len(sample) > 0 {
-				b.out <- sample
-			}
 		} else {
 			break
+		}
+
+		if sample := b.popSample(); len(sample) > 0 {
+			select {
+			case b.out <- sample:
+				// ok
+			default:
+				b.logger.Warnw("buffer full, dropping sample", nil)
+				loss = true
+				b.stats.PacketsDropped += uint64(len(sample))
+			}
 		}
 	}
 
