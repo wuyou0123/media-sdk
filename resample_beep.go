@@ -84,3 +84,7 @@ func (w *resampleWriter) WriteSample(data PCM16Sample) error {
 	n, _ := w.r.Stream(w.buf)
 	return w.w.WriteSample(w.buf[:n])
 }
+
+func (r *resampleWriter) String() string {
+	return "resampleWriter"
+}
